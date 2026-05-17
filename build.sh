@@ -32,17 +32,17 @@ set -euo pipefail
 MODEL_NAME=""
 IMAGE_TAG="latest"
 TEARDOWN=1
-for arg in "$@"; do
-  case "${arg}" in
-    --model=*) MODEL_NAME="${arg#*=}" ;;
-    --model)   shift; MODEL_NAME="${1:-}" ;;
-    --tag=*)   IMAGE_TAG="${arg#*=}" ;;
-    --tag)     shift; IMAGE_TAG="${1:-}" ;;
-    --no-teardown) TEARDOWN=0 ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model=*) MODEL_NAME="${1#*=}"; shift ;;
+    --model)   MODEL_NAME="${2:-}"; shift 2 ;;
+    --tag=*)   IMAGE_TAG="${1#*=}"; shift ;;
+    --tag)     IMAGE_TAG="${2:-}"; shift 2 ;;
+    --no-teardown) TEARDOWN=0; shift ;;
     -h|--help)
       sed -n '2,/^# ===*$/p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
-    *) echo "Unknown arg: ${arg} (try --help)" >&2; exit 1 ;;
+    *) echo "Unknown arg: $1 (try --help)" >&2; exit 1 ;;
   esac
 done
 
