@@ -2,13 +2,19 @@
 # Runs ON the Hetzner build box, kicked by build.sh via `systemd-run`.
 # Env: MODEL_NAME, IMAGE_TAG, HF_TOKEN, GIT_PAT (all required).
 # Writes /var/run/emudoi-build/done (digest) on success, /var/run/emudoi-build/failed (rc) on error.
-set -uo pipefail
+#
+# `-e` matters here — without it, a failing `docker build` left the script
+# running, an empty DIGEST got written to the `done` marker, and build.sh's
+# poll loop reported "BUILD SUCCEEDED" on a broken image (2026-05-17).
+set -euo pipefail
 
 LOG=/var/log/emudoi-build.log
 exec > >(tee -a "${LOG}") 2>&1
 
 mkdir -p /var/run/emudoi-build
-trap 'rc=$?; [ -f /var/run/emudoi-build/done ] || echo "${rc}" > /var/run/emudoi-build/failed' EXIT
+# Write `failed` on ANY non-zero exit (set -e makes most steps abort the
+# script), with the rc captured before the trap body runs anything else.
+trap 'rc=$?; if [ "${rc}" -ne 0 ]; then echo "${rc}" > /var/run/emudoi-build/failed; fi' EXIT
 
 : "${MODEL_NAME:?MODEL_NAME required}"
 : "${IMAGE_TAG:?IMAGE_TAG required}"
@@ -41,6 +47,12 @@ docker push "${IMAGE_FULL}"
 
 echo "=== capture digest ==="
 DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_FULL}")
+if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "<no value>" ]; then
+  echo "ERROR: docker inspect returned an empty digest after push — aborting."
+  exit 1
+fi
+# Only mark `done` after every guard passed; failure trap relies on this
+# marker being absent to know it's the canonical failure record.
 echo "${DIGEST}" > /var/run/emudoi-build/done
 echo "DIGEST=${DIGEST}"
 echo "=== remote-build.sh done ==="

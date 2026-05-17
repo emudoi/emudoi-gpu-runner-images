@@ -398,6 +398,18 @@ while :; do
   case "${STATE}" in
     done)
       DIGEST=$(ssh "${SSH_OPTS[@]}" "root@${SERVER_IP}" "cat /var/run/emudoi-build/done")
+      # An empty digest means remote-build.sh wrote the marker before
+      # actually capturing one — old bug we shouldn't trust silently.
+      if [ -z "${DIGEST}" ]; then
+        echo
+        echo "=============================================================="
+        echo "BUILD MARKER PRESENT BUT DIGEST EMPTY — treating as FAILURE."
+        echo "Last 80 lines of /var/log/emudoi-build.log:"
+        echo "--------------------------------------------------------------"
+        ssh "${SSH_OPTS[@]}" "root@${SERVER_IP}" "tail -80 /var/log/emudoi-build.log" 2>/dev/null || true
+        echo "=============================================================="
+        exit 1
+      fi
       echo
       echo "=============================================================="
       echo "BUILD SUCCEEDED in $(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s"
