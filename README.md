@@ -34,11 +34,16 @@ The image slug is derived from the model name: `Qwen/Qwen2.5-7B-Instruct` →
 2. Have three credentials ready (first run prompts and caches under
    `~/.config/emudoi/`; subsequent runs reuse the cache):
 
-   | Var             | Where to get it                                |
-   |-----------------|------------------------------------------------|
-   | `HETZNER_TOKEN` | Hetzner Cloud console → API tokens             |
-   | `GIT_PAT`       | github.com/settings/tokens — scopes: `repo` + `write:packages` |
-   | `HF_TOKEN`      | huggingface.co/settings/tokens                 |
+   | Var             | Required? | Where to get it                                |
+   |-----------------|-----------|------------------------------------------------|
+   | `HETZNER_TOKEN` | yes       | Hetzner Cloud console → API tokens             |
+   | `GIT_PAT`       | yes       | github.com/settings/tokens — scope: `repo` (used for `git clone` on the box) |
+   | `GHCR_PAT`      | optional  | Second GitHub PAT used for `docker push` to GHCR — scope: `write:packages`. Leave blank to reuse `GIT_PAT`. |
+   | `HF_TOKEN`      | yes       | huggingface.co/settings/tokens                 |
+
+   The script validates each token up front before touching Hetzner, so a
+   bad scope never costs you a wasted build. On failure it prints the
+   exact cache file to delete to re-prompt with a fresh value.
 
 3. Local tools: `curl`, `jq`, `ssh`, `scp` (all standard).
 

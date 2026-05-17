@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Runs ON the Hetzner build box, kicked by build.sh via `systemd-run`.
-# Env: MODEL_NAME, IMAGE_TAG, HF_TOKEN, GIT_PAT (all required).
+# Env (all required unless noted):
+#   MODEL_NAME, IMAGE_TAG, HF_TOKEN
+#   GIT_PAT     used for `git clone` (needs `repo`)
+#   GHCR_PAT    used for `docker login ghcr.io` (needs `write:packages`).
+#               build.sh defaults it to GIT_PAT if the operator didn't supply
+#               a separate one, so it's never empty by the time we see it.
 # Writes /var/run/emudoi-build/done (digest) on success, /var/run/emudoi-build/failed (rc) on error.
 #
 # `-e` matters here — without it, a failing `docker build` left the script
@@ -20,6 +25,7 @@ trap 'rc=$?; if [ "${rc}" -ne 0 ]; then echo "${rc}" > /var/run/emudoi-build/fai
 : "${IMAGE_TAG:?IMAGE_TAG required}"
 : "${HF_TOKEN:?HF_TOKEN required}"
 : "${GIT_PAT:?GIT_PAT required}"
+: "${GHCR_PAT:?GHCR_PAT required (build.sh should default this to GIT_PAT)}"
 
 IMAGE_SLUG=$(echo "${MODEL_NAME#*/}" | tr '[:upper:]' '[:lower:]')
 IMAGE_FULL="ghcr.io/emudoi/${IMAGE_SLUG}:${IMAGE_TAG}"
@@ -30,7 +36,7 @@ echo "IMAGE_FULL=${IMAGE_FULL}"
 date -u
 
 echo "=== docker login ghcr.io ==="
-echo "${GIT_PAT}" | docker login ghcr.io -u emudoi --password-stdin
+echo "${GHCR_PAT}" | docker login ghcr.io -u emudoi --password-stdin
 
 echo "=== docker build ==="
 # Dockerfile + remote-build.sh both land in /root/ via scp.

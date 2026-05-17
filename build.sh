@@ -16,8 +16,15 @@
 #
 # Prompts for any credential not pre-set or cached at ~/.config/emudoi/:
 #   HETZNER_TOKEN     Hetzner Cloud API token
-#   GIT_PAT           GitHub PAT, scopes: repo + write:packages
+#   GIT_PAT           GitHub PAT used for `git clone` on the box (scope: repo)
+#   GHCR_PAT          OPTIONAL second PAT used for `docker push` to GHCR
+#                     (scope: write:packages). Leave blank to reuse GIT_PAT.
+#                     Useful when one classic PAT has `repo` and a separate
+#                     fine-grained or org-scoped PAT carries packages write.
 #   HF_TOKEN          HuggingFace token (model download)
+#
+# All four are validated up front (small auth-only GETs) before any Hetzner
+# provisioning, so a bad token never costs you a 30-min build.
 #
 # Optional env vars:
 #   NODE_NAME         default: emudoi-image-builder
@@ -84,9 +91,12 @@ done
 
 # Cached credentials — same pattern as dev-up.sh's RCLONE_DRIVE_TOKEN cache.
 # Each cached file is chmod 600 inside chmod 700 dir; first paste persists.
+# 4th arg sets policy:
+#   "required" (default) — empty input is fatal
+#   "optional"           — empty input returns empty string, nothing is cached
 mkdir -p "${CACHE_DIR}" && chmod 700 "${CACHE_DIR}"
 resolve_cred() {
-  local var="$1" prompt="$2" cache="${CACHE_DIR}/$3"
+  local var="$1" prompt="$2" cache="${CACHE_DIR}/$3" policy="${4:-required}"
   local val="${!var:-}"
   if [ -z "${val}" ] && [ -f "${cache}" ]; then
     val=$(cat "${cache}")
@@ -95,7 +105,14 @@ resolve_cred() {
     printf "%s" "${prompt}" >&2
     IFS= read -rs val < /dev/tty
     echo >&2
-    [ -n "${val}" ] || { echo "[build] ERROR: empty ${var}" >&2; exit 1; }
+    if [ -z "${val}" ]; then
+      if [ "${policy}" = "optional" ]; then
+        printf ''
+        return 0
+      fi
+      echo "[build] ERROR: empty ${var}" >&2
+      exit 1
+    fi
     umask 077 && printf '%s' "${val}" > "${cache}"
     log "Cached ${var} at ${cache}" >&2
   fi
@@ -103,9 +120,19 @@ resolve_cred() {
 }
 
 HETZNER_TOKEN=$(resolve_cred HETZNER_TOKEN "Hetzner Cloud API token: " hetzner-token)
-GIT_PAT=$(resolve_cred GIT_PAT "GitHub PAT (repo + write:packages): " ghcr-pat)
+# Two slots for GitHub PATs — one is enough if it carries both scopes:
+#   GIT_PAT   (required) — used for `git clone` on the box. Needs `repo`.
+#   GHCR_PAT  (optional) — used for `docker login ghcr.io`. Needs `write:packages`
+#                          (+ `read:packages`). Leave blank to reuse GIT_PAT —
+#                          handy when one PAT carries both scopes, useful when
+#                          you'd rather scope the GHCR push to its own token.
+GIT_PAT=$(resolve_cred GIT_PAT "GitHub PAT for git clone (repo): " git-pat)
+GHCR_PAT=$(resolve_cred GHCR_PAT \
+  "GitHub PAT for GHCR push (write:packages) [blank to reuse the one above]: " \
+  ghcr-write-pat optional)
+: "${GHCR_PAT:=${GIT_PAT}}"
 HF_TOKEN=$(resolve_cred HF_TOKEN "HuggingFace token: " hf-token)
-export HETZNER_TOKEN GIT_PAT HF_TOKEN
+export HETZNER_TOKEN GIT_PAT GHCR_PAT HF_TOKEN
 
 if [ -z "${MODEL_NAME}" ]; then
   printf "HuggingFace model name [Qwen/Qwen2.5-7B-Instruct]: "
@@ -120,6 +147,57 @@ esac
 IMAGE_SLUG=$(echo "${MODEL_NAME#*/}" | tr '[:upper:]' '[:lower:]')
 IMAGE_FULL="ghcr.io/emudoi/${IMAGE_SLUG}:${IMAGE_TAG}"
 log "Will build and push: ${IMAGE_FULL}"
+
+# =============================================================================
+# Token pre-flight — bail BEFORE any provisioning if a token doesn't have the
+# scope it needs. Each failure points at the exact cache file to delete to
+# re-prompt with a fresh value. Cheap (4 small GETs) and prevents the 30-min
+# "build everything, then fail at push" loop.
+# =============================================================================
+log "Validating tokens before provisioning..."
+FAILS=0
+
+# 1. HETZNER_TOKEN — any authenticated GET works. /locations is small.
+if ! curl -sfo /dev/null -H "Authorization: Bearer ${HETZNER_TOKEN}" \
+    "${HETZNER_API}/locations"; then
+  echo "[build] ERROR: HETZNER_TOKEN rejected by Hetzner API." >&2
+  echo "[build]        Re-prompt: rm ${CACHE_DIR}/hetzner-token" >&2
+  FAILS=$((FAILS+1))
+fi
+
+# 2. GIT_PAT — needs to be able to read this org's repos.
+if ! curl -sfo /dev/null -H "Authorization: token ${GIT_PAT}" \
+    "https://api.github.com/repos/emudoi/emudoi-gpu-runner-images"; then
+  echo "[build] ERROR: GIT_PAT can't read emudoi/emudoi-gpu-runner-images." >&2
+  echo "[build]        Needs 'repo' scope. Re-prompt: rm ${CACHE_DIR}/git-pat" >&2
+  FAILS=$((FAILS+1))
+fi
+
+# 3. GHCR_PAT — token-exchange with push,pull scopes. 200 = can push.
+GHCR_HTTP=$(curl -so /dev/null -w '%{http_code}' \
+  -u "emudoi:${GHCR_PAT}" \
+  "https://ghcr.io/token?service=ghcr.io&scope=repository:emudoi/${IMAGE_SLUG}:push,pull")
+if [ "${GHCR_HTTP}" != "200" ]; then
+  echo "[build] ERROR: GHCR_PAT can't push to ghcr.io/emudoi/${IMAGE_SLUG} (HTTP ${GHCR_HTTP})." >&2
+  echo "[build]        Needs 'write:packages' (classic) or Packages: Read & write (fine-grained)." >&2
+  echo "[build]        Re-prompt: rm ${CACHE_DIR}/ghcr-write-pat" >&2
+  echo "[build]        (If you reused GIT_PAT for this slot, rm ${CACHE_DIR}/git-pat too.)" >&2
+  FAILS=$((FAILS+1))
+fi
+
+# 4. HF_TOKEN — whoami; cheap and definitive.
+if ! curl -sfo /dev/null -H "Authorization: Bearer ${HF_TOKEN}" \
+    "https://huggingface.co/api/whoami-v2"; then
+  echo "[build] ERROR: HF_TOKEN rejected by HuggingFace." >&2
+  echo "[build]        Re-prompt: rm ${CACHE_DIR}/hf-token" >&2
+  FAILS=$((FAILS+1))
+fi
+
+if [ "${FAILS}" -gt 0 ]; then
+  echo "[build] ${FAILS} token check(s) failed — fix above before re-running." >&2
+  exit 1
+fi
+log "All tokens validated."
 
 SSH_OPTS=(-i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 
@@ -364,6 +442,7 @@ ssh "${SSH_OPTS[@]}" "root@${SERVER_IP}" "
     --setenv=IMAGE_TAG='${IMAGE_TAG}' \
     --setenv=HF_TOKEN='${HF_TOKEN}' \
     --setenv=GIT_PAT='${GIT_PAT}' \
+    --setenv=GHCR_PAT='${GHCR_PAT}' \
     bash /root/remote-build.sh
 "
 
