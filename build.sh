@@ -169,6 +169,93 @@ teardown() {
 trap teardown EXIT
 
 # =============================================================================
+# 0. Resolve DATACENTER from /v1/datacenters BEFORE provisioning anything.
+#
+# Why not /server_types: that endpoint returns global pricing for every SKU,
+# which doesn't reflect what THIS project can actually provision — the SKU
+# might be priced in a DC the project's quota or current inventory state
+# blocks. The 422 "unsupported location for server type" error is Hetzner
+# telling us "your project can't get this SKU in this DC right now."
+#
+# Authoritative answer: /v1/datacenters returns per-DC
+# .server_types.available — the SKU IDs the DC has live inventory for, for
+# this token's project. We resolve $SERVER_TYPE to an id, then find DCs
+# where it's in .available.
+#
+# We then pass `datacenter: "<dc-name>"` (e.g. "nbg1-dc3") on server create
+# instead of `location: "<loc>"` — Hetzner accepts both, but datacenter is
+# more precise and matches what /datacenters returns.
+#
+# This block is up here (before firewall + ssh key) so --list-locations is
+# a read-only inspection — no side effects to clean up.
+# =============================================================================
+ST_ID=$(api "${HETZNER_API}/server_types?name=${SERVER_TYPE}" \
+  | jq -r '.server_types[0].id // empty')
+if [ -z "${ST_ID}" ]; then
+  echo "[build] ERROR: no server_type named '${SERVER_TYPE}' in Hetzner catalog." >&2
+  exit 1
+fi
+DC_JSON=$(api "${HETZNER_API}/datacenters?per_page=50")
+AVAILABLE_DCS=$(echo "${DC_JSON}" | jq -r --argjson id "${ST_ID}" '
+  .datacenters[]
+  | select(.server_types.available | index($id))
+  | "\(.name)\t\(.location.name)"
+')
+
+if [ "${LIST_LOCATIONS}" = "1" ]; then
+  echo "Datacenters with ${SERVER_TYPE} in stock right now (this project):"
+  if [ -z "${AVAILABLE_DCS}" ]; then
+    echo "  (none — every DC is out of stock for ${SERVER_TYPE})"
+    echo "  Try a different SERVER_TYPE. SKUs your project can see:"
+    echo "${DC_JSON}" | jq -r '[.datacenters[].server_types.available[]] | unique | .[]' \
+      | while read -r sid; do
+          api "${HETZNER_API}/server_types/${sid}" \
+            | jq -r '.server_type | "    \(.name)\t\(.cores) cores / \(.memory)GB / \(.disk)GB"'
+        done
+  else
+    echo "${AVAILABLE_DCS}" | awk '{printf "  %-12s (location: %s)\n", $1, $2}'
+  fi
+  TEARDOWN=0  # nothing was provisioned; don't try to delete anything
+  exit 0
+fi
+
+if [ -z "${AVAILABLE_DCS}" ]; then
+  echo "[build] ERROR: no datacenter has '${SERVER_TYPE}' in stock for your project right now." >&2
+  echo "[build]        Run \`./build.sh --list-locations\` to see SKUs your project can provision." >&2
+  echo "[build]        Or override: SERVER_TYPE=cpx31 ./build.sh ..." >&2
+  exit 1
+fi
+
+# If LOCATION is set, restrict the DC list to that location.
+if [ -n "${LOCATION}" ]; then
+  FILTERED=$(echo "${AVAILABLE_DCS}" | awk -v loc="${LOCATION}" '$2 == loc {print}')
+  if [ -z "${FILTERED}" ]; then
+    echo "[build] ERROR: ${SERVER_TYPE} not in stock in location '${LOCATION}' right now." >&2
+    echo "[build]        Available DCs for ${SERVER_TYPE}:" >&2
+    echo "${AVAILABLE_DCS}" | awk '{printf "  %-12s (location: %s)\n", $1, $2}' >&2
+    exit 1
+  fi
+  AVAILABLE_DCS="${FILTERED}"
+fi
+
+# Pick a DC. Prefer EU locations (nbg1/fsn1/hel1) first for lower GHCR egress.
+DATACENTER=""
+for pref_loc in nbg1 fsn1 hel1 ash hil sin; do
+  cand=$(echo "${AVAILABLE_DCS}" | awk -v loc="${pref_loc}" '$2 == loc {print $1; exit}')
+  if [ -n "${cand}" ]; then
+    DATACENTER="${cand}"
+    LOCATION="${pref_loc}"
+    break
+  fi
+done
+if [ -z "${DATACENTER}" ]; then
+  # Fall back: pick whatever DC came first.
+  DATACENTER=$(echo "${AVAILABLE_DCS}" | head -n1 | awk '{print $1}')
+  LOCATION=$(echo "${AVAILABLE_DCS}" | head -n1 | awk '{print $2}')
+fi
+log "Auto-selected DATACENTER=${DATACENTER} (location=${LOCATION})"
+
+# =============================================================================
 # 1. Cloud firewall (SSH only inbound, all outbound)
 # =============================================================================
 log "Configuring firewall '${FIREWALL_NAME}'..."
@@ -203,50 +290,6 @@ if [ -z "${SSH_KEY_ID}" ]; then
 fi
 
 # =============================================================================
-# 2b. Resolve LOCATION from the API — avoids the 422 "unsupported location
-# for server type" trap. The CPX line is AMD-only and not all Hetzner DCs
-# have AMD inventory; rather than hard-code a guess, we query
-# /v1/server_types?name=$SERVER_TYPE and read .prices[].location (each DC
-# that prices the SKU is one that sells it).
-# =============================================================================
-ST_JSON=$(api "${HETZNER_API}/server_types?name=${SERVER_TYPE}")
-AVAILABLE_LOCS=$(echo "${ST_JSON}" | jq -r '.server_types[0].prices[]?.location' | sort -u)
-if [ -z "${AVAILABLE_LOCS}" ]; then
-  echo "[build] ERROR: Hetzner reports no locations for SERVER_TYPE='${SERVER_TYPE}'." >&2
-  echo "[build]        Either the name is wrong or the SKU is retired. Try one of:" >&2
-  api "${HETZNER_API}/server_types?per_page=50" \
-    | jq -r '.server_types[] | "  \(.name)\t\(.cores) cores / \(.memory)GB / \(.disk)GB"' >&2
-  exit 1
-fi
-
-if [ "${LIST_LOCATIONS}" = "1" ]; then
-  echo "Locations where ${SERVER_TYPE} is available:"
-  echo "${ST_JSON}" \
-    | jq -r '.server_types[0].prices[] | "  \(.location)\t€\(.price_hourly.gross|tonumber|.*10000|round/10000)/h"'
-  TEARDOWN=0  # nothing was provisioned; don't try to delete anything
-  exit 0
-fi
-
-if [ -n "${LOCATION}" ]; then
-  if ! echo "${AVAILABLE_LOCS}" | grep -qx "${LOCATION}"; then
-    echo "[build] ERROR: ${SERVER_TYPE} is not offered in '${LOCATION}'." >&2
-    echo "[build]        Available locations for ${SERVER_TYPE}:" >&2
-    echo "${AVAILABLE_LOCS}" | sed 's/^/  /' >&2
-    exit 1
-  fi
-else
-  # Auto-pick. Prefer EU DCs first (lower egress to GHCR EU), fall back to
-  # whatever the API offers. `head -n1` of the preferred-then-available list.
-  for pref in nbg1 fsn1 hel1 ash hil sin; do
-    if echo "${AVAILABLE_LOCS}" | grep -qx "${pref}"; then
-      LOCATION="${pref}"; break
-    fi
-  done
-  [ -n "${LOCATION}" ] || LOCATION=$(echo "${AVAILABLE_LOCS}" | head -n1)
-  log "Auto-selected LOCATION=${LOCATION} (available: $(echo ${AVAILABLE_LOCS} | tr '\n' ' '))"
-fi
-
-# =============================================================================
 # 3. Server — refuse to clobber an existing build, otherwise create fresh
 # =============================================================================
 EXISTING=$(api "${HETZNER_API}/servers?name=${NODE_NAME}" | jq -r '.servers[0].id // empty')
@@ -260,19 +303,19 @@ if [ -n "${EXISTING}" ]; then
   exit 1
 fi
 
-log "Creating server '${NODE_NAME}' (${SERVER_TYPE}) in ${LOCATION}..."
+log "Creating server '${NODE_NAME}' (${SERVER_TYPE}) in ${DATACENTER}..."
 PAYLOAD=$(jq -n \
   --arg name "${NODE_NAME}" \
   --arg server_type "${SERVER_TYPE}" \
   --arg image "${IMAGE}" \
-  --arg location "${LOCATION}" \
+  --arg datacenter "${DATACENTER}" \
   --argjson ssh_key_id "${SSH_KEY_ID}" \
   --argjson firewall_id "${FIREWALL_ID}" \
   '{
     name: $name,
     server_type: $server_type,
     image: $image,
-    location: $location,
+    datacenter: $datacenter,
     ssh_keys: [$ssh_key_id],
     firewalls: [{firewall: $firewall_id}],
     start_after_create: true,
