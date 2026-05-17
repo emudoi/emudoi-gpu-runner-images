@@ -12,6 +12,7 @@
 #   ./build.sh --model Qwen/Qwen2.5-7B-Instruct
 #   ./build.sh --model meta-llama/Llama-3.1-8B-Instruct --tag vllm0.10
 #   ./build.sh --no-teardown        # keep the box after build (debugging)
+#   ./build.sh --list-locations     # print which DCs sell SERVER_TYPE and exit
 #
 # Prompts for any credential not pre-set or cached at ~/.config/emudoi/:
 #   HETZNER_TOKEN     Hetzner Cloud API token
@@ -21,7 +22,8 @@
 # Optional env vars:
 #   NODE_NAME         default: emudoi-image-builder
 #   SERVER_TYPE       default: cpx41 (16vCPU shared / 32GB / 240GB, ~€0.068/h)
-#   LOCATION          default: nbg1  (Nuremberg — cpx41 isn't in hel1)
+#   LOCATION          default: auto — picked from /v1/server_types at runtime
+#                     (preferred order: nbg1 > fsn1 > hel1 > ash > hil > sin)
 #   MAX_BUILD_HOURS   default: 3  (kill switch — server torn down regardless)
 #
 # SSH key: ${REPO_ROOT}/emudoi_infra_desktop_only — gitignored. Same key as
@@ -32,6 +34,7 @@ set -euo pipefail
 MODEL_NAME=""
 IMAGE_TAG="latest"
 TEARDOWN=1
+LIST_LOCATIONS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --model=*) MODEL_NAME="${1#*=}"; shift ;;
@@ -39,6 +42,7 @@ while [ $# -gt 0 ]; do
     --tag=*)   IMAGE_TAG="${1#*=}"; shift ;;
     --tag)     IMAGE_TAG="${2:-}"; shift 2 ;;
     --no-teardown) TEARDOWN=0; shift ;;
+    --list-locations) LIST_LOCATIONS=1; shift ;;
     -h|--help)
       sed -n '2,/^# ===*$/p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -49,7 +53,9 @@ done
 HETZNER_API="https://api.hetzner.cloud/v1"
 NODE_NAME="${NODE_NAME:-emudoi-image-builder}"
 SERVER_TYPE="${SERVER_TYPE:-cpx41}"
-LOCATION="${LOCATION:-nbg1}"
+# LOCATION is auto-discovered from the API if empty — see "Resolve location"
+# block below. Set it explicitly only if you need a specific DC.
+LOCATION="${LOCATION:-}"
 IMAGE="ubuntu-24.04"
 SSH_KEY_NAME="emudoi-infra-desktop-only"
 FIREWALL_NAME="${NODE_NAME}-firewall"
@@ -194,6 +200,50 @@ if [ -z "${SSH_KEY_ID}" ]; then
   SSH_KEY_ID=$(api -X POST -H "Content-Type: application/json" \
     -d "$(jq -n --arg name "${SSH_KEY_NAME}" --arg key "${SSH_PUB_KEY}" '{name:$name,public_key:$key}')" \
     "${HETZNER_API}/ssh_keys" | jq -r '.ssh_key.id')
+fi
+
+# =============================================================================
+# 2b. Resolve LOCATION from the API — avoids the 422 "unsupported location
+# for server type" trap. The CPX line is AMD-only and not all Hetzner DCs
+# have AMD inventory; rather than hard-code a guess, we query
+# /v1/server_types?name=$SERVER_TYPE and read .prices[].location (each DC
+# that prices the SKU is one that sells it).
+# =============================================================================
+ST_JSON=$(api "${HETZNER_API}/server_types?name=${SERVER_TYPE}")
+AVAILABLE_LOCS=$(echo "${ST_JSON}" | jq -r '.server_types[0].prices[]?.location' | sort -u)
+if [ -z "${AVAILABLE_LOCS}" ]; then
+  echo "[build] ERROR: Hetzner reports no locations for SERVER_TYPE='${SERVER_TYPE}'." >&2
+  echo "[build]        Either the name is wrong or the SKU is retired. Try one of:" >&2
+  api "${HETZNER_API}/server_types?per_page=50" \
+    | jq -r '.server_types[] | "  \(.name)\t\(.cores) cores / \(.memory)GB / \(.disk)GB"' >&2
+  exit 1
+fi
+
+if [ "${LIST_LOCATIONS}" = "1" ]; then
+  echo "Locations where ${SERVER_TYPE} is available:"
+  echo "${ST_JSON}" \
+    | jq -r '.server_types[0].prices[] | "  \(.location)\t€\(.price_hourly.gross|tonumber|.*10000|round/10000)/h"'
+  TEARDOWN=0  # nothing was provisioned; don't try to delete anything
+  exit 0
+fi
+
+if [ -n "${LOCATION}" ]; then
+  if ! echo "${AVAILABLE_LOCS}" | grep -qx "${LOCATION}"; then
+    echo "[build] ERROR: ${SERVER_TYPE} is not offered in '${LOCATION}'." >&2
+    echo "[build]        Available locations for ${SERVER_TYPE}:" >&2
+    echo "${AVAILABLE_LOCS}" | sed 's/^/  /' >&2
+    exit 1
+  fi
+else
+  # Auto-pick. Prefer EU DCs first (lower egress to GHCR EU), fall back to
+  # whatever the API offers. `head -n1` of the preferred-then-available list.
+  for pref in nbg1 fsn1 hel1 ash hil sin; do
+    if echo "${AVAILABLE_LOCS}" | grep -qx "${pref}"; then
+      LOCATION="${pref}"; break
+    fi
+  done
+  [ -n "${LOCATION}" ] || LOCATION=$(echo "${AVAILABLE_LOCS}" | head -n1)
+  log "Auto-selected LOCATION=${LOCATION} (available: $(echo ${AVAILABLE_LOCS} | tr '\n' ' '))"
 fi
 
 # =============================================================================

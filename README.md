@@ -14,7 +14,7 @@ weights + vLLM + CUDA 12.9 runtime baked in.
 
 The script:
 
-1. Provisions a fresh Hetzner Cloud VM (`cpx41`, `nbg1`, ~€0.07/h)
+1. Provisions a fresh Hetzner Cloud VM (`cpx41`, auto-picked DC, ~€0.07/h)
 2. Installs Docker on it
 3. Runs `docker build` with `MODEL_NAME` + `HF_TOKEN` as build-args
 4. Pushes the resulting image to `ghcr.io/emudoi/<model-slug>:<tag>`
@@ -49,6 +49,7 @@ The image slug is derived from the model name: `Qwen/Qwen2.5-7B-Instruct` →
 | `--model <name>` | prompt (default `Qwen/Qwen2.5-7B-Instruct`) | HF model to bake |
 | `--tag <tag>` | `latest` | GHCR image tag |
 | `--no-teardown` | off | Leave the box up after the build (debugging) |
+| `--list-locations` | off | Print which DCs sell the chosen `SERVER_TYPE`, then exit |
 
 Optional env overrides: `NODE_NAME`, `SERVER_TYPE`, `LOCATION`, `MAX_BUILD_HOURS`.
 
