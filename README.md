@@ -14,7 +14,7 @@ weights + vLLM + CUDA 12.9 runtime baked in.
 
 The script:
 
-1. Provisions a fresh Hetzner Cloud VM (`cpx41`, `hel1`, ~€0.07/h)
+1. Provisions a fresh Hetzner Cloud VM (`cpx41`, `nbg1`, ~€0.07/h)
 2. Installs Docker on it
 3. Runs `docker build` with `MODEL_NAME` + `HF_TOKEN` as build-args
 4. Pushes the resulting image to `ghcr.io/emudoi/<model-slug>:<tag>`

@@ -21,7 +21,7 @@
 # Optional env vars:
 #   NODE_NAME         default: emudoi-image-builder
 #   SERVER_TYPE       default: cpx41 (16vCPU shared / 32GB / 240GB, ~€0.068/h)
-#   LOCATION          default: hel1
+#   LOCATION          default: nbg1  (Nuremberg — cpx41 isn't in hel1)
 #   MAX_BUILD_HOURS   default: 3  (kill switch — server torn down regardless)
 #
 # SSH key: ${REPO_ROOT}/emudoi_infra_desktop_only — gitignored. Same key as
@@ -49,7 +49,7 @@ done
 HETZNER_API="https://api.hetzner.cloud/v1"
 NODE_NAME="${NODE_NAME:-emudoi-image-builder}"
 SERVER_TYPE="${SERVER_TYPE:-cpx41}"
-LOCATION="${LOCATION:-hel1}"
+LOCATION="${LOCATION:-nbg1}"
 IMAGE="ubuntu-24.04"
 SSH_KEY_NAME="emudoi-infra-desktop-only"
 FIREWALL_NAME="${NODE_NAME}-firewall"
