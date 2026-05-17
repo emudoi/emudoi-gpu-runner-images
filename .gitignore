@@ -1,0 +1,4 @@
+emudoi_infra_desktop_only
+.venv/
+vendor/
+.DS_Store
